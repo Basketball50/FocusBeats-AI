@@ -37,6 +37,9 @@ from scripts.lofi_layers import apply_lofi_layers, ensure_stereo_ch_first
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONTROLLER_MODEL = ROOT / "models" / "xgb_ranker_controller.json"
 DEFAULT_CONTROLLER_COLS = ROOT / "models" / "controller_feature_cols.json"
+TARGET_RMS_DB = -18.0
+PEAK_LIMIT = 0.98
+SILENCE_FLOOR_DB = -60.0
 
 
 def _safe_float(x: Any, default: float = 0.0) -> float:
@@ -49,6 +52,71 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
         return v
     except Exception:
         return default
+
+
+def _db_to_amp(db: float) -> float:
+    return float(10.0 ** (db / 20.0))
+
+def _rms_db(y: np.ndarray) -> float:
+    y = np.asarray(y, dtype=np.float32)
+    if y.size == 0:
+        return -120.0
+    r = float(np.sqrt(np.mean(y * y) + 1e-12))
+    return float(20.0 * np.log10(r + 1e-12))
+
+
+def _normalize_rms(y: np.ndarray, target_rms_db: float, silence_floor_db: float = SILENCE_FLOOR_DB) -> np.ndarray:
+    y = np.asarray(y, dtype=np.float32)
+    cur = _rms_db(y)
+    if cur < float(silence_floor_db):
+        return y.astype(np.float32)
+    gain_db = float(target_rms_db) - cur
+    gain = float(10.0 ** (gain_db / 20.0))
+    return (y * gain).astype(np.float32)
+
+
+def _peak_limit(y: np.ndarray, peak: float = PEAK_LIMIT) -> np.ndarray:
+    y = np.asarray(y, dtype=np.float32)
+    if y.size == 0:
+        return y.astype(np.float32)
+    p = float(np.max(np.abs(y))) + 1e-12
+    if p > float(peak):
+        y = y * (float(peak) / p)
+    return y.astype(np.float32)
+
+
+def _normalize_for_metrics_mono(y: np.ndarray) -> np.ndarray:
+    y = np.asarray(y, dtype=np.float32)
+    y = _normalize_rms(y, TARGET_RMS_DB, silence_floor_db=SILENCE_FLOOR_DB)
+    y = _peak_limit(y, PEAK_LIMIT)
+    return y.astype(np.float32)
+
+
+def _normalize_for_output_stereo(y_stereo_n2: np.ndarray) -> np.ndarray:
+    y = np.asarray(y_stereo_n2, dtype=np.float32)
+    if y.size == 0:
+        return y.astype(np.float32)
+    if y.ndim != 2 or y.shape[1] < 2:
+        mono = y.reshape(-1).astype(np.float32)
+        mono = _normalize_for_metrics_mono(mono)
+        if mono.ndim == 1:
+            mono = mono.reshape(-1, 1)
+        if mono.shape[1] == 1:
+            mono = np.concatenate([mono, mono], axis=1)
+        return mono.astype(np.float32)
+
+    mono = np.mean(y[:, :2], axis=1).astype(np.float32)
+    cur = _rms_db(mono)
+    if cur >= float(SILENCE_FLOOR_DB):
+        gain_db = float(TARGET_RMS_DB) - cur
+        gain = float(10.0 ** (gain_db / 20.0))
+        y = (y * gain).astype(np.float32)
+
+    p = float(np.max(np.abs(y))) + 1e-12
+    if p > float(PEAK_LIMIT):
+        y = (y * (float(PEAK_LIMIT) / p)).astype(np.float32)
+
+    return y.astype(np.float32)
 
 
 def _load_controller_cols(path: Path) -> List[str]:
@@ -64,9 +132,9 @@ def _ensure_wav_preserve_stereo(in_path: Path) -> Path:
         raise RuntimeError(f"Empty/invalid audio: {in_path}")
 
     if isinstance(y, np.ndarray) and y.ndim == 2:
-        y_to_write = y.T.astype(np.float32) 
+        y_to_write = y.T.astype(np.float32)
     else:
-        y_to_write = np.asarray(y, dtype=np.float32) 
+        y_to_write = np.asarray(y, dtype=np.float32)
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="fb_"))
     wav_path = tmp_dir / (in_path.stem + "_src.wav")
@@ -75,7 +143,7 @@ def _ensure_wav_preserve_stereo(in_path: Path) -> Path:
 
 
 def _center_cancel_vocal_reduce(stereo_wav: Path) -> Path:
-    y, sr = sf.read(str(stereo_wav), always_2d=True) 
+    y, sr = sf.read(str(stereo_wav), always_2d=True)
     if y.shape[1] < 2:
         mono = y[:, 0].astype(np.float32)
     else:
@@ -298,7 +366,6 @@ def _inject_best_features(feat_dict: Dict[str, float], cand: Dict[str, float]) -
     feat_dict["best_transient_amount"] = float(cand.get("transient_smooth", 0.0))
     feat_dict["best_drc_strength"] = float(cand.get("drc_strength", 0.0))
     feat_dict["best_compressor_strength"] = float(cand.get("drc_strength", 0.0))
-
     feat_dict.setdefault("best_grid_focus", 0.0)
     feat_dict.setdefault("best_grid_score", 0.0)
     feat_dict.setdefault("best_grid_sim", 0.0)
@@ -363,7 +430,7 @@ def _jsonify(x: Any) -> Any:
 
 
 def _ensure_mono_wav_for_scoring(audio_path: Path) -> Path:
-    y, sr = sf.read(str(audio_path), always_2d=True)  
+    y, sr = sf.read(str(audio_path), always_2d=True)
     y = y.astype(np.float32)
     if y.shape[1] == 1:
         mono = y[:, 0]
@@ -372,6 +439,8 @@ def _ensure_mono_wav_for_scoring(audio_path: Path) -> Path:
 
     if mono.size < 256:
         raise RuntimeError(f"Audio too short for scoring: {audio_path} (samples={mono.size})")
+
+    mono = _normalize_for_metrics_mono(mono)
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="fb_score_"))
     out_wav = tmp_dir / (audio_path.stem + "_mono_score.wav")
@@ -391,6 +460,9 @@ def main():
     parser.add_argument("--demucs_required", action="store_true")
 
     parser.add_argument("--lofi_layers_dir", default=str(ROOT / "data" / "lofi_layers_prepped"))
+    parser.add_argument("--lofi_enabled", type=int, default=1, help="1=apply lofi (default), 0=skip lofi")
+    parser.add_argument("--lofi_gain_db", type=float, default=0.0, help="post-mix lofi gain in dB (default 0.0)")
+
     parser.add_argument(
         "--write_meta",
         action="store_true",
@@ -436,7 +508,6 @@ def main():
         }
 
     work_wav = _maybe_trim(instr_wav, float(args.trim_seconds))
-
     base_feats = _compute_base_features(work_wav)
     cols = _load_controller_cols(controller_cols)
     base_feat_dict, emb_meta = _fill_controller_feature_dict(cols, base_feats, work_wav)
@@ -453,49 +524,62 @@ def main():
     dsp_out.parent.mkdir(parents=True, exist_ok=True)
     apply_dsp(work_wav, dsp_out, knobs)
 
-    y_dsp, sr_dsp = sf.read(str(dsp_out), always_2d=True)  
+    y_dsp, sr_dsp = sf.read(str(dsp_out), always_2d=True)
     y_dsp = y_dsp.astype(np.float32)
 
     if y_dsp.shape[1] == 1:
-        y_base_stereo = np.concatenate([y_dsp, y_dsp], axis=1)  
+        y_base_stereo = np.concatenate([y_dsp, y_dsp], axis=1)
     else:
-        y_base_stereo = y_dsp[:, :2]  
+        y_base_stereo = y_dsp[:, :2]
 
-    base2n = ensure_stereo_ch_first(y_base_stereo) 
+    base2n = ensure_stereo_ch_first(y_base_stereo)  
+
+    lofi_enabled = int(args.lofi_enabled) != 0
+    lofi_gain_db = float(args.lofi_gain_db)
 
     lofi_amount = float(knobs.get("lofi_amount", 0.70))
     seed = _stable_int_seed(in_path.name)
 
-    y_lofi_2n, used_layers = apply_lofi_layers(
-        base2n=base2n,
-        sr=int(sr_dsp),
-        layers_dir=lofi_layers_dir,
-        amount=lofi_amount,
-        seed=seed,
-    )
+    if lofi_enabled:
+        y_lofi_2n, used_layers = apply_lofi_layers(
+            base2n=base2n,
+            sr=int(sr_dsp),
+            layers_dir=lofi_layers_dir,
+            amount=lofi_amount,
+            seed=seed,
+        )
+        if abs(lofi_gain_db) > 1e-9:
+            g = _db_to_amp(lofi_gain_db)
+            diff = (y_lofi_2n - base2n).astype(np.float32)
+            y_lofi_2n = (base2n + diff * g).astype(np.float32)
+    else:
+        y_lofi_2n = base2n
+        used_layers = []
 
     used_layers = used_layers or []
     lofi_used_layers_str = ";".join([str(s) for s in used_layers])
     lofi_used_layers_count = int(len(used_layers))
 
-    y_final_stereo = np.asarray(y_lofi_2n, dtype=np.float32).T
-    mx = float(np.max(np.abs(y_final_stereo))) if y_final_stereo.size else 0.0
-    if mx > 0:
-        y_final_stereo = (0.97 * y_final_stereo / mx).astype(np.float32)
+    y_final_stereo = np.asarray(y_lofi_2n, dtype=np.float32).T  
+    y_final_stereo = _normalize_for_output_stereo(y_final_stereo)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    sf.write(str(out_path), y_final_stereo, int(sr_dsp))
+    sf.write(str(out_path), y_final_stereo.astype(np.float32), int(sr_dsp))
 
     yamnet = load_yamnet()
     focus_model, mean, scale = load_focus_model()
 
-    work_score_wav = _ensure_mono_wav_for_scoring(Path(work_wav))
-    out_score_wav = _ensure_mono_wav_for_scoring(Path(out_path))
+    raw_score_wav = _ensure_mono_wav_for_scoring(Path(src_wav))       
+    instr_score_wav = _ensure_mono_wav_for_scoring(Path(work_wav))     
+    dsp_score_wav = _ensure_mono_wav_for_scoring(Path(dsp_out))        
+    out_score_wav = _ensure_mono_wav_for_scoring(Path(out_path))     
 
-    focus_before = float(score_file(yamnet, focus_model, mean, scale, work_score_wav))
+    raw_focus = float(score_file(yamnet, focus_model, mean, scale, raw_score_wav))
+    focus_before = float(score_file(yamnet, focus_model, mean, scale, instr_score_wav))
+    focus_post_dsp = float(score_file(yamnet, focus_model, mean, scale, dsp_score_wav))
     focus_after = float(score_file(yamnet, focus_model, mean, scale, out_score_wav))
 
-    emb_before = compute_yamnet_embedding(yamnet, work_score_wav).astype(np.float32)
+    emb_before = compute_yamnet_embedding(yamnet, instr_score_wav).astype(np.float32)
     emb_after = compute_yamnet_embedding(yamnet, out_score_wav).astype(np.float32)
 
     num = float(np.dot(emb_before, emb_after))
@@ -505,12 +589,18 @@ def main():
     duration_sec = float(y_final_stereo.shape[0] / sr_dsp) if sr_dsp else 0.0
 
     metrics = {
-        "focus_before": focus_before,
-        "focus_after": focus_after,
+        "focus_before": focus_before,  
+        "focus_after": focus_after,    
         "focus_delta": focus_after - focus_before,
         "yamnet_similarity": sim,
         "yamnet_distance": 1.0 - sim,
         "duration_sec_output": duration_sec,
+
+        "focus_raw": raw_focus,
+        "focus_post_dsp": focus_post_dsp,
+        "focus_delta_raw_to_final": focus_after - raw_focus,
+        "focus_delta_instr_to_post_dsp": focus_post_dsp - focus_before,
+        "focus_delta_post_dsp_to_final": focus_after - focus_post_dsp,
     }
 
     meta = {
@@ -522,12 +612,13 @@ def main():
             "xgb controller selects knobs (best_* injected)",
             "apply dsp knobs (clean EQ + stable compressor)",
             "apply lofi layers (prepped layer files; intermittent textures)",
-            "focus score (before/after)",
-            "yamnet similarity (before/after)",
+            "focus score (raw/instrumental/post-dsp/final)",
+            "yamnet similarity (instrumental/final)",
         ],
         "input": str(in_path),
         "src_wav": str(src_wav),
         "instrumental_wav": str(work_wav),
+        "dsp_wav": str(dsp_out),
         "output": str(out_path),
         "trim_seconds": float(args.trim_seconds),
         "dsp_impl": "scripts.dsp.apply_dsp",
@@ -535,7 +626,10 @@ def main():
         "controller_cols": str(controller_cols),
         "controller_cols_count": len(cols),
 
-        "lofi_used": True,
+        "lofi_enabled": bool(lofi_enabled),
+        "lofi_gain_db": float(lofi_gain_db),
+
+        "lofi_used": bool(lofi_enabled),
         "lofi_amount_used": lofi_amount,
         "lofi_seed": int(seed),
         "lofi_layers_dir": str(lofi_layers_dir),
@@ -543,6 +637,10 @@ def main():
         "lofi_used_layers": lofi_used_layers_str,
         "lofi_used_layers_count": lofi_used_layers_count,
         "lofi_used_layers_list": _jsonify(used_layers),
+
+        "normalization_target_rms_db": float(TARGET_RMS_DB),
+        "normalization_peak_limit": float(PEAK_LIMIT),
+        "normalization_silence_floor_db": float(SILENCE_FLOOR_DB),
 
         **vocals_meta,
         **emb_meta,
@@ -554,7 +652,7 @@ def main():
     print(json.dumps(payload, indent=2))
 
     if args.write_meta:
-        meta_path = out_path.with_suffix(out_path.suffix + ".meta.json")  
+        meta_path = out_path.with_suffix(out_path.suffix + ".meta.json")
         meta_path.write_text(json.dumps(payload, indent=2))
         print(f"[INFO] Wrote metadata: {meta_path}")
 
