@@ -1,4 +1,3 @@
-# scripts/app_api.py
 from __future__ import annotations
 
 import json
@@ -20,7 +19,9 @@ UPLOAD_DIR = DATA_DIR / "api_uploads"
 OUT_DIR = DATA_DIR / "api_outputs"
 
 DEFAULT_CONTROLLER_MODEL = PROJECT_ROOT / "models" / "xgb_ranker_controller.json"
-DEFAULT_CONTROLLER_COLS = PROJECT_ROOT / "models" / "controller_feature_cols.json"
+DEFAULT_CONTROLLER_COLS = PROJECT_ROOT / "models" / "controller_feature_cols_NOTEBOOK_ORDER.json"
+DEFAULT_CTRL_LOOKUP_CSV = DATA_DIR / "eval" / "controller_dataset_yamnet_m003.csv"
+
 DEFAULT_LOFI_LAYERS_DIR = DATA_DIR / "lofi_layers_prepped"
 
 ALLOWED_AUDIO_EXTS = {".wav", ".mp3", ".flac", ".aiff", ".aif", ".m4a", ".ogg", ".aac"}
@@ -91,11 +92,12 @@ def _parse_float(x: str, default: float) -> float:
         return default
 
 
-def run_transform_one(
+def run_transform_one_v2(
     input_path: Path,
     output_path: Path,
     controller_model: Path,
     controller_cols: Path,
+    ctrl_lookup_csv: Path,
     lofi_layers_dir: Path,
     trim_seconds: float,
     demucs_required: bool,
@@ -108,7 +110,7 @@ def run_transform_one(
     cmd = [
         py,
         "-m",
-        "scripts.transform_one",
+        "scripts.transform_onev2",  
         "--in",
         str(input_path),
         "--out",
@@ -118,6 +120,8 @@ def run_transform_one(
         str(controller_model),
         "--controller_cols",
         str(controller_cols),
+        "--ctrl_lookup_csv",
+        str(ctrl_lookup_csv),
         "--lofi_layers_dir",
         str(lofi_layers_dir),
         "--trim_seconds",
@@ -153,7 +157,7 @@ def run_transform_one(
     }
 
     if proc.returncode != 0:
-        err = (stderr or stdout or "transform_one failed").strip()
+        err = (stderr or stdout or "transform_onev2 failed").strip()
         return False, err[:4000], debug
 
     payload = None
@@ -166,11 +170,9 @@ def run_transform_one(
         payload = None
 
     debug["parsed_payload"] = bool(payload)
+    debug["payload"] = payload if isinstance(payload, dict) else None
 
-    if payload is None:
-        return True, "", {**debug, "payload": None}
-
-    return True, "", {**debug, "payload": payload}
+    return True, "", debug
 
 
 app = Flask(__name__)
@@ -193,7 +195,9 @@ def health():
             "defaults": {
                 "controller_model": str(DEFAULT_CONTROLLER_MODEL),
                 "controller_cols": str(DEFAULT_CONTROLLER_COLS),
+                "ctrl_lookup_csv": str(DEFAULT_CTRL_LOOKUP_CSV),
                 "lofi_layers_dir": str(DEFAULT_LOFI_LAYERS_DIR),
+                "pipeline_module": "scripts.transform_onev2",
             },
         }
     )
@@ -213,7 +217,6 @@ def pipeline():
     if ext and ext not in ALLOWED_AUDIO_EXTS:
         return _json_error(f"Unsupported extension: {ext}", 400, {"allowed": sorted(ALLOWED_AUDIO_EXTS)})
 
-    # ---- read optional controls (defaults keep your abstract valid)
     lofi_enabled = _parse_boolish(request.form.get("lofi_enabled"), True)
     lofi_gain_db = _parse_float(request.form.get("lofi_gain_db"), 0.0)
 
@@ -225,16 +228,15 @@ def pipeline():
     input_path = (UPLOAD_DIR / saved_name).resolve()
     f.save(str(input_path))
 
-    # Fail fast if required assets missing
     for label, p in [
         ("controller_model", DEFAULT_CONTROLLER_MODEL),
         ("controller_cols", DEFAULT_CONTROLLER_COLS),
+        ("ctrl_lookup_csv", DEFAULT_CTRL_LOOKUP_CSV),
         ("lofi_layers_dir", DEFAULT_LOFI_LAYERS_DIR),
     ]:
         if not Path(p).exists():
             return _json_error(f"{label} not found", 500, {label: str(p)})
 
-    # Ensure demucs is available (since demucs_required=True below)
     py = _python_for_pipeline()
     env = _env_for_subprocess()
     ok_demucs, demucs_err = _check_demucs_available(py, env)
@@ -258,11 +260,12 @@ def pipeline():
     trim_seconds = 0.0
     demucs_required = True
 
-    ok, err, debug = run_transform_one(
+    ok, err, debug = run_transform_one_v2(
         input_path=input_path,
         output_path=out_wav,
         controller_model=DEFAULT_CONTROLLER_MODEL,
         controller_cols=DEFAULT_CONTROLLER_COLS,
+        ctrl_lookup_csv=DEFAULT_CTRL_LOOKUP_CSV,
         lofi_layers_dir=DEFAULT_LOFI_LAYERS_DIR,
         trim_seconds=trim_seconds,
         demucs_required=demucs_required,
@@ -271,7 +274,7 @@ def pipeline():
     )
 
     if not ok:
-        print("\n[PIPELINE ERROR] transform_one failed")
+        print("\n[PIPELINE ERROR] transform_onev2 failed")
         print(debug.get("cmd"))
         print(debug.get("stderr_tail") or debug.get("stdout_tail"))
         print()
@@ -284,7 +287,7 @@ def pipeline():
             {"output_wav": str(out_wav), "debug": debug},
         )
 
-    payload = debug.get("payload") or {}
+    payload = (debug.get("payload") or {}) if isinstance(debug, dict) else {}
 
     if not out_meta.exists() and isinstance(payload, dict) and payload:
         try:
