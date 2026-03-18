@@ -1,0 +1,125 @@
+import React, { useEffect, useRef, useState } from 'react';
+import './App.css';
+import Upload from './Upload';
+
+function App() {
+  const infoRef = useRef(null);
+  const [infoVisible, setInfoVisible] = useState(false);
+  const [currentView, setCurrentView] = useState('home'); 
+
+  const appStyle = {
+    minHeight: '100vh',
+    backgroundImage: 'url(/background.png)',
+    backgroundSize: 'cover',
+    backgroundPosition: 'center',
+    backgroundRepeat: 'no-repeat',
+    backgroundAttachment: 'fixed',
+  };
+
+  useEffect(() => {
+    if (currentView !== 'home') return;
+
+    const section = infoRef.current;
+    if (!section) return;
+
+    if (!('IntersectionObserver' in window)) {
+      setInfoVisible(true);
+      return;
+    }
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => {
+          if (entry.isIntersecting) {
+            setInfoVisible(true);
+            observer.disconnect();
+          }
+        });
+      },
+      { threshold: 0.2 }
+    );
+
+    observer.observe(section);
+    return () => observer.disconnect();
+  }, [currentView]);
+
+  const handleGetStartedClick = () => {
+    setCurrentView('upload');
+  };
+
+  return (
+    <div className="App" style={appStyle}>
+      <div className="overlay">
+        {currentView === 'home' ? (
+          <>
+            <section className="hero">
+              <div className="hero-content fade-in">
+                <div className="hero-pill">
+                  Focus-ready audio, powered by DSP + ML
+                </div>
+                <h1 className="hero-title">
+                  Focus Beats <span className="hero-title-accent">AI</span>
+                </h1>
+                <p className="hero-subtitle">
+                  Turn the tracks you already love into clean, distraction-light
+                  soundscapes for deep work—without losing their rhythm or personality.
+                </p>
+                <button className="cta-button" onClick={handleGetStartedClick}>
+                  Get Started
+                </button>
+              </div>
+            </section>
+
+            <section
+              ref={infoRef}
+              className={`info-section ${infoVisible ? 'visible' : ''}`}
+            >
+              <div className="info-content">
+                <h2>What Focus Beats AI does</h2>
+                <p>
+                  Upload a song, let the engine analyze it, and download a focus-optimized
+                  version that still feels like the original: same groove, less noise in
+                  your head.
+                </p>
+
+                <div className="info-grid">
+                  <div className="info-card">
+                    <h3>1. Listen inside your track</h3>
+                    <p>
+                      The system measures tempo stability, dynamics, and spectral
+                      texture to estimate how conducive the song is for sustained focus.
+                    </p>
+                  </div>
+                  <div className="info-card">
+                    <h3>2. Dial down distractions</h3>
+                    <p>
+                      Gentle EQ, compression, and vocal softening reduce harshness
+                      and sudden spikes that pull your attention away.
+                    </p>
+                  </div>
+                  <div className="info-card">
+                    <h3>3. Keep the identity</h3>
+                    <p>
+                      A similarity measure helps preserve rhythm, key, and overall feel,
+                      so it still sounds like your song, just tuned for concentration.
+                    </p>
+                  </div>
+                </div>
+
+                <p className="coming-soon-note">
+                  A simple upload flow, intelligent processing, and a clean download
+                  experience—all centered around helping you stay in the zone.
+                </p>
+              </div>
+            </section>
+          </>
+        ) : (
+          <Upload onBack={() => setCurrentView('home')} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+export default App;
+
